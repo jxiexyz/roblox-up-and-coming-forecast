@@ -1,233 +1,154 @@
-// roblox-up-and-coming-forecast-01: Monte Carlo rank-diffusion forecaster
-// with tenure hazard, momentum, mean-reversion, and newcomer injection
+// roblox-up-and-coming-forecast-01: Concentrated rank-distribution forecaster
+// with exponential recency, persistence blend, breakout detection
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-interface GameRow {
-  rank: number;
-  universe_id: number;
-  name: string;
-  playing: number;
-}
-
-interface Snapshot {
-  at: string;
-  up_and_coming: GameRow[];
-  top_trending: GameRow[] | null;
-  top_playing_now: Array<{ rank: number; universe_id: number; playing: number }> | null;
-}
+interface GameRow { rank: number; universe_id: number; name: string; playing: number }
+interface Snapshot { at: string; up_and_coming: GameRow[]; top_trending: GameRow[] | null }
 
 const task = JSON.parse(readFileSync(join(inputDir, 'task.json'), 'utf8')) as {
-  places: number;
-  output: string;
-  window: { from: string; until: string; slots: number; slot_minutes: number };
+  places: number; output: string;
+  window: { from: string; until: string; slots: number };
   history_until: string;
 };
 const rawLines = readFileSync(join(inputDir, 'history.ndjson'), 'utf8').trim().split('\n');
-const snapshots: Snapshot[] = rawLines.map((l) => JSON.parse(l));
+const snaps: Snapshot[] = rawLines.map(l => JSON.parse(l));
 const PLACES = task.places;
-const N_SIM = 5000;
-const SEED = 42;
+const N = snaps.length;
 
-// Deterministic PRNG (mulberry32)
-function mulberry32(a: number) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-const rng = mulberry32(SEED);
-
-function randn(): number {
-  let u = 0, v = 0;
-  while (u === 0) u = rng();
-  while (v === 0) v = rng();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
-
-// --- Build game histories from snapshots ---
-const gameHistories = new Map<number, Array<{ snapIdx: number; rank: number; playing: number }>>();
-for (let i = 0; i < snapshots.length; i++) {
-  for (const g of snapshots[i].up_and_coming) {
-    if (!gameHistories.has(g.universe_id)) gameHistories.set(g.universe_id, []);
-    gameHistories.get(g.universe_id)!.push({ snapIdx: i, rank: g.rank, playing: g.playing });
-  }
-}
-
-// --- Compute rank-dependent volatility from observed transitions ---
-const rankVolatility: number[] = new Array(101).fill(2.0);
-{
-  const changesByRank: Map<number, number[]> = new Map();
-  for (let i = 0; i < snapshots.length - 1; i++) {
-    const currMap = new Map(snapshots[i].up_and_coming.map(g => [g.universe_id, g.rank]));
-    const nextMap = new Map(snapshots[i + 1].up_and_coming.map(g => [g.universe_id, g.rank]));
-    const dt = (new Date(snapshots[i + 1].at).getTime() - new Date(snapshots[i].at).getTime()) / 3600000;
-    const dtNorm = Math.max(1, dt) / 6;
-    for (const [uid, r] of currMap) {
-      const nr = nextMap.get(uid);
-      if (nr !== undefined) {
-        const bucket = Math.min(r, 100);
-        if (!changesByRank.has(bucket)) changesByRank.set(bucket, []);
-        changesByRank.get(bucket)!.push((nr - r) / Math.sqrt(dtNorm));
-      }
-    }
-  }
-  for (const [rank, changes] of changesByRank) {
-    if (changes.length < 3) continue;
-    const mean = changes.reduce((a, b) => a + b, 0) / changes.length;
-    const variance = changes.reduce((a, b) => a + (b - mean) ** 2, 0) / changes.length;
-    rankVolatility[rank] = Math.max(0.3, Math.sqrt(variance));
-  }
-  // Smooth gaps
-  for (let r = 2; r < 99; r++) {
-    if (!changesByRank.has(r) || (changesByRank.get(r)?.length ?? 0) < 5) {
-      rankVolatility[r] = (rankVolatility[r - 1] + rankVolatility[r + 1]) / 2;
-    }
-  }
-}
-
-// --- Build game states from last snapshot ---
-interface GameState {
-  universe_id: number;
-  rank: number;
+// --- Per-game profiles ---
+interface Profile {
+  uid: number;
+  rankObs: Array<{ snapIdx: number; rank: number; playing: number }>;
+  currentRank: number;
   momentum: number;
   tenure: number;
-  meanRank: number;
-  onTopTrending: boolean;
 }
 
-const lastSnap = snapshots[snapshots.length - 1];
-const topTrendingSet = new Set<number>();
-if (lastSnap.top_trending) {
-  for (const g of lastSnap.top_trending.slice(0, 30)) {
-    topTrendingSet.add(g.universe_id);
+const profiles = new Map<number, Profile>();
+for (let i = 0; i < N; i++) {
+  for (const g of snaps[i].up_and_coming) {
+    let p = profiles.get(g.universe_id);
+    if (!p) {
+      p = { uid: g.universe_id, rankObs: [], currentRank: 999, momentum: 0, tenure: 0 };
+      profiles.set(g.universe_id, p);
+    }
+    p.rankObs.push({ snapIdx: i, rank: g.rank, playing: g.playing });
+    p.tenure++;
   }
 }
 
-const chartSize = lastSnap.up_and_coming.length;
-const games: GameState[] = [];
+// Current state
+const lastSnap = snaps[N - 1];
+const prevSnap = N >= 2 ? snaps[N - 2] : null;
+const prevMap = prevSnap ? new Map(prevSnap.up_and_coming.map(g => [g.universe_id, g])) : new Map<number, GameRow>();
 
 for (const g of lastSnap.up_and_coming) {
-  const hist = gameHistories.get(g.universe_id)!;
-  const tenure = hist.length;
-  const recentRanks = hist.slice(-5).map(h => h.rank);
-  const meanRank = recentRanks.reduce((a, b) => a + b, 0) / recentRanks.length;
+  const p = profiles.get(g.universe_id)!;
+  p.currentRank = g.rank;
+  const prev = prevMap.get(g.universe_id);
+  if (prev && prev.playing > 0) p.momentum = (g.playing - prev.playing) / prev.playing;
+}
 
-  let momentum = 0;
-  if (hist.length >= 2) {
-    const h1 = hist[hist.length - 1];
-    const h2 = hist[hist.length - 2];
-    if (h2.playing > 0) momentum = (h1.playing - h2.playing) / h2.playing;
+// --- Compute probability for each (game, place) ---
+// Score = blend of:
+//   A) Empirical: recency-weighted rank proximity from actual observations
+//   B) Persistence: how close current rank is to this place
+//   C) Breakout: extra probability at top places for rising games
+
+const halfLife = 7; // snapshots for recency decay
+
+function computeScore(prof: Profile, place: number): number {
+  // A) Empirical rank occupancy with Gaussian kernel
+  let empScore = 0;
+  let empTotalW = 0;
+
+  // Adaptive sigma: for stable games (low rank variance) use tight kernel
+  // For volatile games use wider kernel
+  const recentRanks = prof.rankObs.slice(-5).map(o => o.rank);
+  const mean = recentRanks.reduce((a, b) => a + b, 0) / recentRanks.length;
+  const std = Math.sqrt(recentRanks.reduce((a, b) => a + (b - mean) ** 2, 0) / recentRanks.length);
+  const sigma = Math.max(2.5, Math.min(8, std * 2 + 1));
+
+  for (const obs of prof.rankObs) {
+    const age = N - 1 - obs.snapIdx;
+    const recencyW = Math.exp(-age * Math.LN2 / halfLife);
+    const diff = place - obs.rank;
+    const gaussW = Math.exp(-(diff * diff) / (2 * sigma * sigma));
+    empScore += recencyW * gaussW;
+    empTotalW += recencyW;
   }
+  empScore = empTotalW > 0 ? empScore / empTotalW : 0;
 
-  games.push({
-    universe_id: g.universe_id,
-    rank: g.rank,
-    momentum: Math.max(-1, Math.min(1, momentum)),
-    tenure,
-    meanRank,
-    onTopTrending: topTrendingSet.has(g.universe_id),
-  });
-}
+  // B) Persistence: Gaussian around current rank
+  const persScore = prof.currentRank <= 200
+    ? Math.exp(-((place - prof.currentRank) ** 2) / (2 * 5 * 5))
+    : 0;
 
-// --- Monte Carlo simulation ---
-const totalSlots = task.window.slots;
-const placeCountsByGame = new Map<number, Float64Array>();
-for (const g of games) {
-  placeCountsByGame.set(g.universe_id, new Float64Array(PLACES + 1));
-}
-
-for (let sim = 0; sim < N_SIM; sim++) {
-  const currentRanks = games.map(g => g.rank as number);
-  const dropped = new Array(games.length).fill(false);
-
-  for (let hour = 0; hour < totalSlots; hour++) {
-    for (let gi = 0; gi < games.length; gi++) {
-      if (dropped[gi]) continue;
-      const game = games[gi];
-      const r = currentRanks[gi];
-      const bucket = Math.min(Math.round(r), 100);
-      const vol = rankVolatility[bucket] || 2.0;
-
-      // Mean-reversion toward recent average
-      const meanRevDrift = 0.05 * (game.meanRank - r);
-      // Momentum: positive playing growth -> rank improves (toward 1)
-      const momDrift = -game.momentum * 0.3;
-      // Tenure hazard: long-lived games drift down slightly
-      const tenFrac = game.tenure / snapshots.length;
-      const tenDrift = tenFrac > 0.8 ? 0.5 : tenFrac > 0.6 ? 0.2 : 0;
-      // Top trending bonus
-      const trendDrift = game.onTopTrending ? -0.1 : 0;
-      // Hourly vol (snapshots ~6h apart)
-      const hourlyVol = vol / Math.sqrt(6);
-
-      const drift = meanRevDrift + momDrift + tenDrift + trendDrift;
-      let newRank = r + drift + randn() * hourlyVol;
-      newRank = Math.max(1, newRank);
-
-      if (newRank > chartSize + 10) {
-        dropped[gi] = true;
-        currentRanks[gi] = chartSize + 50;
-        continue;
-      }
-      currentRanks[gi] = newRank;
-    }
-
-    // Argsort to get discrete positions
-    const indices = games.map((_, i) => i).filter(i => !dropped[i]);
-    indices.sort((a, b) => currentRanks[a] - currentRanks[b]);
-
-    for (let p = 0; p < Math.min(PLACES, indices.length); p++) {
-      placeCountsByGame.get(games[indices[p]].universe_id)![p + 1]++;
+  // C) Breakout boost for top places
+  let breakout = 0;
+  if (prof.momentum > 0.15 && prof.currentRank <= 15 && place <= 10) {
+    breakout = 0.15 * Math.exp(-((place - Math.max(1, prof.currentRank - 3)) ** 2) / 18);
+  }
+  // Rank-climbing detection
+  if (recentRanks.length >= 3) {
+    const climb = recentRanks[0] - recentRanks[recentRanks.length - 1];
+    if (climb > 5 && place <= 10) {
+      breakout += 0.1 * Math.exp(-((place - Math.max(1, prof.currentRank - 2)) ** 2) / 18);
     }
   }
+
+  // Blend: 45% empirical, 35% persistence, 20% breakout
+  return 0.45 * empScore + 0.35 * persScore + 0.20 * breakout;
 }
 
-// --- Build forecast ---
 const probabilities: Array<{ universe_id: number; place: number; p: number }> = [];
 
 for (let place = 1; place <= PLACES; place++) {
-  const candidates: Array<{ universe_id: number; p: number }> = [];
-  for (const [uid, counts] of placeCountsByGame) {
-    const p = counts[place] / (N_SIM * totalSlots);
-    if (p >= 0.005) candidates.push({ universe_id: uid, p });
-  }
-  candidates.sort((a, b) => b.p - a.p);
-  const topCands = candidates.slice(0, 80);
+  const scored: Array<{ uid: number; score: number }> = [];
 
-  let sum = topCands.reduce((a, c) => a + c.p, 0);
-  const maxSum = 0.92;
-  if (sum > maxSum) {
-    const scale = maxSum / sum;
-    for (const c of topCands) c.p *= scale;
+  for (const [uid, prof] of profiles) {
+    const s = computeScore(prof, place);
+    if (s > 0.001) scored.push({ uid, score: s });
   }
 
-  for (const c of topCands) {
-    probabilities.push({
-      universe_id: c.universe_id,
-      place,
-      p: Math.round(c.p * 10000) / 10000,
-    });
+  // Sort and keep top candidates
+  scored.sort((a, b) => b.score - a.score);
+
+  // Power-law concentration: raise scores to power > 1 to concentrate probability
+  // Higher power = more concentrated on top candidates
+  const power = 1.8;
+  const topK = scored.slice(0, 30);
+  for (const c of topK) c.score = Math.pow(c.score, power);
+
+  const total = topK.reduce((a, c) => a + c.score, 0);
+  const namedBudget = 0.88; // leave 12% unnamed
+
+  for (const c of topK) {
+    const p = (c.score / total) * namedBudget;
+    if (p >= 0.005) {
+      probabilities.push({
+        universe_id: c.uid,
+        place,
+        p: Math.round(p * 10000) / 10000,
+      });
+    }
   }
 }
 
-// Top 10: games with highest overall top-10 presence
-const top10Scores = new Map<number, number>();
-for (const [uid, counts] of placeCountsByGame) {
-  let total = 0;
-  for (let p = 1; p <= PLACES; p++) total += counts[p];
-  top10Scores.set(uid, total);
+// Top 10: games most likely to be anywhere in top 10
+const top10Map = new Map<number, number>();
+for (const entry of probabilities) {
+  top10Map.set(entry.universe_id, (top10Map.get(entry.universe_id) || 0) + entry.p);
 }
-const top10 = [...top10Scores.entries()]
+const top10 = [...top10Map.entries()]
   .sort((a, b) => b[1] - a[1])
   .slice(0, PLACES)
   .map(([uid]) => uid);
 
 const result = { probabilities, top10 };
 writeFileSync(join(outputDir, task.output), `${JSON.stringify(result)}\n`, 'utf8');
-console.log(`Forecast: ${probabilities.length} probs, ${N_SIM} sims x ${totalSlots} slots`);
+console.log(`Forecast: ${probabilities.length} probs, top10=${top10.join(',')}`);
