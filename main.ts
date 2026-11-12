@@ -1,5 +1,6 @@
-// roblox-up-and-coming-forecast-01: Calibrated rank forecast with concentrated probability
-// Key insight: ~7-8 candidates per place, top getting 20-30%, unnamed mass ~15%
+// roblox-up-and-coming-forecast-01: Log-rank Monte Carlo forecaster
+// Models log(rank) as Brownian motion with rank-dependent drift and volatility
+// Calibrated from observed historical transitions
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -7,7 +8,7 @@ const inputDir = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const outputDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 interface GameRow { rank: number; universe_id: number; name: string; playing: number }
-interface Snap { at: string; up_and_coming: GameRow[]; top_trending: GameRow[] | null }
+interface Snap { at: string; up_and_coming: GameRow[] }
 
 const task = JSON.parse(readFileSync(join(inputDir, 'task.json'), 'utf8')) as {
   places: number; output: string;
@@ -17,113 +18,166 @@ const rawLines = readFileSync(join(inputDir, 'history.ndjson'), 'utf8').trim().s
 const snaps: Snap[] = rawLines.map(l => JSON.parse(l));
 const PLACES = task.places;
 const N = snaps.length;
+const SLOTS = task.window.slots;
+const N_SIM = 8000;
+const SEED = 42;
 
-// --- Build game profiles ---
-const gameObs = new Map<number, Array<{ idx: number; rank: number; playing: number }>>();
-for (let i = 0; i < N; i++) {
-  for (const g of snaps[i].up_and_coming) {
-    if (!gameObs.has(g.universe_id)) gameObs.set(g.universe_id, []);
-    gameObs.get(g.universe_id)!.push({ idx: i, rank: g.rank, playing: g.playing });
+// Deterministic PRNG
+function mulberry32(a: number) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(SEED);
+function randn(): number {
+  let u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+// --- Calibrate drift and volatility from history ---
+// Compute per-hour log-rank changes, bucketed by rank
+interface CalibBucket { drift: number; sigma: number }
+
+const buckets: CalibBucket[] = [];
+const bucketEdges = [0, 3, 8, 15, 30, 60, 200];
+
+for (let b = 0; b < bucketEdges.length - 1; b++) {
+  const lo = bucketEdges[b];
+  const hi = bucketEdges[b + 1];
+  const changes: number[] = [];
+
+  for (let i = 0; i < N - 1; i++) {
+    const curr = new Map(snaps[i].up_and_coming.map(g => [g.universe_id, g.rank]));
+    const next = new Map(snaps[i + 1].up_and_coming.map(g => [g.universe_id, g.rank]));
+    const hours = Math.max(1, (new Date(snaps[i + 1].at).getTime() - new Date(snaps[i].at).getTime()) / 3600000);
+
+    for (const [uid, r1] of curr) {
+      const r2 = next.get(uid);
+      if (r2 && r1 > lo && r1 <= hi) {
+        changes.push((Math.log(r2) - Math.log(r1)) / Math.sqrt(hours));
+      }
+    }
+  }
+
+  if (changes.length > 5) {
+    const mean = changes.reduce((a, c) => a + c, 0) / changes.length;
+    const variance = changes.reduce((a, c) => a + (c - mean) ** 2, 0) / changes.length;
+    buckets.push({ drift: mean, sigma: Math.sqrt(variance) });
+  } else {
+    buckets.push({ drift: 0, sigma: 0.09 });
   }
 }
 
+function getCalib(rank: number): CalibBucket {
+  for (let b = 0; b < bucketEdges.length - 1; b++) {
+    if (rank > bucketEdges[b] && rank <= bucketEdges[b + 1]) return buckets[b];
+  }
+  return buckets[buckets.length - 1];
+}
+
+// --- Build game list from last snapshot ---
 const lastSnap = snaps[N - 1];
 const chartSize = lastSnap.up_and_coming.length;
+
+interface Game {
+  uid: number;
+  logRank: number; // log of current rank
+  momentum: number; // player growth rate
+}
+
+const games: Game[] = [];
 const prevSnap = N >= 2 ? snaps[N - 2] : null;
 const prevMap = prevSnap ? new Map(prevSnap.up_and_coming.map(g => [g.universe_id, g])) : null;
 
-// --- Score each game for each place ---
-// Blend of:
-// A) Recency-weighted exact-rank occupancy (strongest signal)
-// B) Current rank persistence with rank-specific decay
-// C) Trend/momentum (rising games)
+for (const g of lastSnap.up_and_coming) {
+  let momentum = 0;
+  if (prevMap) {
+    const prev = prevMap.get(g.universe_id);
+    if (prev && prev.playing > 100) {
+      momentum = (g.playing - prev.playing) / prev.playing;
+    }
+  }
+  games.push({
+    uid: g.universe_id,
+    logRank: Math.log(g.rank),
+    momentum: Math.max(-0.5, Math.min(0.5, momentum)),
+  });
+}
 
-const halfLife = 6; // snapshots (~1.5 days)
+// --- Monte Carlo simulation ---
+// For each simulation:
+// 1. Evolve log(rank) per hour with drift + noise
+// 2. At each slot, sort by log-rank to get discrete positions
+// 3. Count place occupancy
 
+const placeCount = new Map<number, Float64Array>();
+for (const g of games) {
+  placeCount.set(g.uid, new Float64Array(PLACES + 1));
+}
+
+for (let sim = 0; sim < N_SIM; sim++) {
+  const logRanks = games.map(g => g.logRank);
+
+  for (let hour = 0; hour < SLOTS; hour++) {
+    // Evolve each game
+    for (let gi = 0; gi < games.length; gi++) {
+      const lr = logRanks[gi];
+      const rank = Math.exp(lr);
+      const calib = getCalib(rank);
+
+      // Drift: calibrated + small momentum component
+      const momDrift = -games[gi].momentum * 0.02; // positive growth → rank drops (improves)
+      const drift = calib.drift + momDrift;
+
+      // Noise: calibrated sigma per sqrt(hour), so per hour: sigma
+      const noise = calib.sigma * randn();
+
+      logRanks[gi] = Math.max(0, lr + drift + noise); // min log-rank = 0 → rank 1
+    }
+
+    // Sort to get positions
+    const indices = games.map((_, i) => i);
+    indices.sort((a, b) => logRanks[a] - logRanks[b]);
+
+    for (let p = 0; p < Math.min(PLACES, indices.length); p++) {
+      placeCount.get(games[indices[p]].uid)![p + 1]++;
+    }
+  }
+}
+
+// --- Build forecast ---
+const totalObs = N_SIM * SLOTS;
 const probabilities: Array<{ universe_id: number; place: number; p: number }> = [];
 
 for (let place = 1; place <= PLACES; place++) {
-  const scored: Array<{ uid: number; w: number }> = [];
+  const candidates: Array<{ uid: number; p: number }> = [];
 
-  for (const [uid, obs] of gameObs) {
-    const currentGame = lastSnap.up_and_coming.find(g => g.universe_id === uid);
-    const currentRank = currentGame?.rank ?? 999;
-    let w = 0;
-
-    // A) Historical occupancy at this exact place (recency-weighted)
-    // Also include nearby ranks with strong decay
-    for (const o of obs) {
-      const age = N - 1 - o.idx;
-      const recency = Math.exp(-age * Math.LN2 / halfLife);
-      const diff = Math.abs(place - o.rank);
-
-      if (diff === 0) {
-        w += recency * 5.0;  // exact match: very strong
-      } else if (diff <= 2) {
-        w += recency * 2.0;  // 1-2 ranks away: strong
-      } else if (diff <= 5) {
-        w += recency * 0.5;  // 3-5 ranks away: moderate
-      } else if (diff <= 10) {
-        w += recency * 0.1;  // 6-10 ranks away: weak
-      }
-    }
-
-    // B) Current rank persistence
-    // How likely is the current occupant to stay?
-    if (currentRank <= chartSize) {
-      const diff = Math.abs(place - currentRank);
-      // Observed persistence: rank 1 stays 76%, rank 2-5 ~48%, rank 6-10 ~35%
-      // But this decays over 72 hours → average persistence
-      const basePers = place <= 1 ? 0.30 : place <= 5 ? 0.20 : 0.15;
-      if (diff === 0) {
-        w += basePers * 8.0;
-      } else if (diff <= 2) {
-        w += basePers * 3.0;
-      } else if (diff <= 5) {
-        w += basePers * 0.8;
-      }
-    }
-
-    // C) Momentum: growing games get boost at better (lower) ranks
-    if (currentGame && prevMap) {
-      const prev = prevMap.get(uid);
-      if (prev && prev.playing > 100) {
-        const growth = (currentGame.playing - prev.playing) / prev.playing;
-        if (growth > 0.15 && place < currentRank && currentRank <= 30) {
-          const climbDist = currentRank - place;
-          if (climbDist <= 10) {
-            w += growth * 2.0 * Math.exp(-climbDist * 0.3);
-          }
-        }
-      }
-    }
-
-    if (w > 0.05) scored.push({ uid, w });
+  for (const [uid, counts] of placeCount) {
+    const p = counts[place] / totalObs;
+    if (p >= 0.003) candidates.push({ uid, p });
   }
 
-  // Sort, take top candidates, apply power concentration
-  scored.sort((a, b) => b.w - a.w);
+  candidates.sort((a, b) => b.p - a.p);
 
-  // Take top 15-20 candidates (enough for coverage, not too many)
-  const topK = scored.slice(0, 18);
+  // Cap total named at 93% (leave 7% for newcomers/unknown)
+  const maxNamed = 0.93;
+  let sum = candidates.reduce((a, c) => a + c.p, 0);
+  if (sum > maxNamed) {
+    const scale = maxNamed / sum;
+    for (const c of candidates) c.p *= scale;
+  }
 
-  // Power-law concentration: raise to power > 1
-  const power = 2.5;  // stronger concentration
-  for (const c of topK) c.w = Math.pow(c.w, power);
-
-  const totalW = topK.reduce((a, c) => a + c.w, 0);
-
-  // Named budget: leave 15% unnamed for newcomers and unknowns
-  // 15% / ~85 unnamed games ≈ 0.18% each (better than 0.1% floor)
-  const namedBudget = 0.85;
-
-  for (const c of topK) {
-    const p = (c.w / totalW) * namedBudget;
-    if (p >= 0.005) {
+  for (const c of candidates) {
+    if (c.p >= 0.005) {
       probabilities.push({
         universe_id: c.uid,
         place,
-        p: Math.round(p * 10000) / 10000,
+        p: Math.round(c.p * 10000) / 10000,
       });
     }
   }
@@ -141,9 +195,9 @@ const top10 = [...top10Map.entries()]
 
 const result = { probabilities, top10 };
 writeFileSync(join(outputDir, task.output), `${JSON.stringify(result)}\n`, 'utf8');
-console.log(`Forecast: ${probabilities.length} probs`);
+console.log(`Forecast: ${probabilities.length} probs, ${N_SIM} sims × ${SLOTS} slots`);
 for (let p = 1; p <= PLACES; p++) {
   const es = probabilities.filter(e => e.place === p).sort((a, b) => b.p - a.p);
   const sum = es.reduce((a, e) => a + e.p, 0);
-  console.log(`  P${p}: ${es.length} games, sum=${sum.toFixed(3)}, top3=[${es.slice(0, 3).map(e => e.p.toFixed(3)).join(',')}]`);
+  console.log(`  P${p}: ${es.length} games, Σ=${sum.toFixed(3)}, top3=[${es.slice(0, 3).map(e => e.p.toFixed(3)).join(',')}]`);
 }
