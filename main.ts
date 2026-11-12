@@ -19,8 +19,12 @@ const snaps: Snap[] = rawLines.map(l => JSON.parse(l));
 const PLACES = task.places;
 const N = snaps.length;
 const SLOTS = task.window.slots;
-const N_SIM = 8000;
+const N_SIM = 10000;
 const SEED = 42;
+
+// Sigma multiplier: scale up calibrated volatility to model
+// breakout events (games jumping 20+ ranks in days)
+const SIGMA_SCALE = 1.8;
 
 // Deterministic PRNG
 function mulberry32(a: number) {
@@ -134,8 +138,8 @@ for (let sim = 0; sim < N_SIM; sim++) {
       const momDrift = -games[gi].momentum * 0.02; // positive growth → rank drops (improves)
       const drift = calib.drift + momDrift;
 
-      // Noise: calibrated sigma per sqrt(hour), so per hour: sigma
-      const noise = calib.sigma * randn();
+      // Noise: calibrated sigma scaled up for heavy tails
+      const noise = calib.sigma * SIGMA_SCALE * randn();
 
       logRanks[gi] = Math.max(0, lr + drift + noise); // min log-rank = 0 → rank 1
     }
@@ -164,8 +168,8 @@ for (let place = 1; place <= PLACES; place++) {
 
   candidates.sort((a, b) => b.p - a.p);
 
-  // Cap total named at 93% (leave 7% for newcomers/unknown)
-  const maxNamed = 0.93;
+  // Cap total named at 88% (leave 12% for newcomers/unknown)
+  const maxNamed = 0.88;
   let sum = candidates.reduce((a, c) => a + c.p, 0);
   if (sum > maxNamed) {
     const scale = maxNamed / sum;
